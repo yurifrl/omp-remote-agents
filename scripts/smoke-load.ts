@@ -1,18 +1,41 @@
 /**
- * Offline smoke: extension factory loads under a mock host API, shadows the
- * `task` tool, and its schema/routing behave without any real runtimes.
- * Runs with HOME pointed at a temp dir so host remote-agents.json cannot
- * influence results; the expected fallback is the native delegation path.
+ * Offline smoke: extension factory loads under a mock host API, registers the
+ * `remote_run` tool, schema validation and runner routing behave without any
+ * real runtimes (the `command` runner executes a local /bin/echo).
+ *
+ * Two stages because Bun caches os.homedir() at process start: stage 1
+ * prepares a temp HOME with its own remote-agents.json, then re-execs this
+ * file with HOME/SMOKE_CHILD set; stage 2 runs the assertions.
  */
 
-import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import factory from "../extensions/remote-agents.ts";
-import { z } from "zod";
 
-process.env.HOME = mkdtempSync(join(tmpdir(), "omp-ra-home-"));
+if (!process.env.SMOKE_CHILD) {
+    const home = mkdtempSync(join(tmpdir(), "omp-ra-home-"));
+    mkdirSync(join(home, ".omp", "agent"), { recursive: true });
+    writeFileSync(
+        join(home, ".omp", "agent", "remote-agents.json"),
+        JSON.stringify({
+            defaultRunner: "echo",
+            runners: {
+                echo: { type: "command", command: ["/bin/echo", "ran:{task}"] },
+                fail: { type: "command", command: ["/bin/sh", "-c", "echo oops >&2; exit 3"] },
+            },
+        }),
+    );
+    const proc = Bun.spawn(["bun", "run", import.meta.path], {
+        env: { ...process.env, HOME: home, SMOKE_CHILD: "1" },
+        stdout: "inherit",
+        stderr: "inherit",
+    });
+    process.exit(await proc.exited);
+}
+
+const { default: factory } = await import("../extensions/remote-agents.ts");
+const assert = (await import("node:assert/strict")).default;
+const { z } = await import("zod");
 
 interface RegisteredTool {
     name: string;
@@ -28,33 +51,49 @@ factory({
     sendMessage: () => assert.fail("sendMessage must not be called during load"),
 });
 
-const task = registered.find((t) => t.name === "task");
-assert.ok(task, "task tool is registered");
-assert.equal(registered.length, 1, "only the task shadow is registered");
+const remoteRun = registered.find((t) => t.name === "remote_run");
+assert.ok(remoteRun, "remote_run tool is registered");
+assert.equal(registered.length, 1, "only remote_run is registered");
 
-// 1. Schema accepts a remote-routed payload and passes unknown keys through.
-const parsed = task.parameters.parse({
-    context: "shared ctx",
-    tasks: [{ task: "do it", solutionSpace: "how", agent: "researcher", async: true, effort: "hi" }],
-});
-assert.equal(parsed.tasks[0].agent, "researcher");
+// 1. Schema accepts a plain run.
+const parsed = remoteRun.parameters.parse({ runner: "echo", task: "hello world" });
+assert.equal(parsed.runner, "echo");
 
-// 2. Schema rejects an empty task list.
-assert.throws(() => task.parameters.parse({ tasks: [] }), /too small/i);
+// 2. Schema rejects an empty task; runner is optional by design.
+assert.throws(() => remoteRun.parameters.parse({ runner: "echo", task: "" }), /too small|at least/i);
 
-// 3. Routing with no config: configured-agent names fall through to native
-//    delegation, which cannot exist under the mock ctx -> expect our error.
+// 3. Unknown runner → error names the configured runners.
 await assert.rejects(
-    task.execute("smoke-1", { tasks: [{ task: "t", solutionSpace: "s", agent: "researcher" }] }, undefined, undefined, {}),
-    /invokeTool/,
-    "unknown agent must reach the native fallback",
+    remoteRun.execute("smoke-1", { runner: "nope", task: "t" }, undefined, undefined, {}),
+    /unknown runner "nope" \(configured: echo, fail\)/,
 );
 
-// 4. Agentless item without defaultRunner: same native fallback.
-await assert.rejects(
-    task.execute("smoke-2", { tasks: [{ task: "t", solutionSpace: "s" }] }, undefined, undefined, {}),
-    /invokeTool/,
-    "agentless without defaultRunner must reach the native fallback",
-);
+// 3b. Omitted runner falls back to defaultRunner.
+const fallback = await remoteRun.execute("smoke-1b", { task: "hello world" }, undefined, undefined, {});
+assert.match(fallback.content?.map((c) => c.text ?? "").join("") ?? "", /ran:hello world/);
 
-console.log("smoke:load OK — task shadow registered, schema validated, routing falls back to native without config");
+// 4. Valid command runner executes locally with {task} substitution.
+const updates: unknown[] = [];
+const res = await remoteRun.execute("smoke-2", { runner: "echo", task: "hello world" }, undefined, (u) => updates.push(u), {});
+const text = res.content?.map((c) => c.text ?? "").join("");
+assert.doesNotMatch(text ?? "", /\[remote-agent/, "success body is the clean remote output, no wrapper header");
+assert.match(text ?? "", /ran:hello world/, "command output captured with {task} substituted");
+assert.equal((res.details as { exitCode?: number }).exitCode, 0);
+
+// 5. Failing runner → isError with header and stderr tail.
+const failed = await remoteRun.execute("smoke-3", { runner: "fail", task: "boom" }, undefined, undefined, {});
+assert.equal(failed.isError, true);
+const failedText = failed.content?.map((c) => c.text ?? "").join("");
+assert.match(failedText ?? "", /\[remote-agent fail\/\w+\] failed \(exit 3\)/);
+assert.match(failedText ?? "", /stderr \(tail\):\noops/);
+
+// 6. Shipped proxy agents parse and reference remote_run.
+const agentsDir = join(import.meta.dir, "..", "agents");
+const { readdirSync, readFileSync } = await import("node:fs");
+for (const entry of readdirSync(agentsDir)) {
+    const md = readFileSync(join(agentsDir, entry), "utf8");
+    assert.match(md, /^---\nname: remote-/, `${entry} has frontmatter`);
+    assert.match(md, /remote_run/, `${entry} instructs remote_run`);
+}
+
+console.log("smoke:load OK — remote_run registered, schema validated, command runner executed, proxy agents present");

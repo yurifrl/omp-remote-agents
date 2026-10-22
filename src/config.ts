@@ -1,20 +1,14 @@
 /**
  * remote-agents.json configuration: global (~/.omp/agent/remote-agents.json)
- * with optional project overlay (./.omp/remote-agents.json). Project agents
- * are appended, runners merge by name, defaultRunner prefers the project.
+ * with optional project overlay (./.omp/remote-agents.json). Runners merge by
+ * name; the project value wins. This file maps runner names to runtime
+ * configs only — model-facing agents (remote-*) ship with the package in
+ * agents/ and are discovered by the native task subsystem.
  */
 
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-
-export interface AgentEntry {
-    name: string;
-    description: string;
-    runner: string;
-    /** Default model passed to the remote omp run when the task omits one. */
-    model?: string;
-}
 
 export interface ContainerRunnerConfig {
     type: "container";
@@ -56,7 +50,6 @@ export type RunnerConfig = ContainerRunnerConfig | K8sRunnerConfig | GenericRunn
 
 export interface RemoteAgentsConfig {
     defaultRunner?: string;
-    agents: AgentEntry[];
     runners: Record<string, RunnerConfig>;
 }
 
@@ -75,14 +68,7 @@ function readJson(path: string): RemoteAgentsConfig {
     }
     const cfg = parsed as Partial<RemoteAgentsConfig>;
     if (!cfg || typeof cfg !== "object") throw new Error(`remote-agents: ${path} must be an object`);
-    if (!Array.isArray(cfg.agents)) throw new Error(`remote-agents: ${path} must define agents: []`);
     if (!cfg.runners || typeof cfg.runners !== "object") throw new Error(`remote-agents: ${path} must define runners: {}`);
-    for (const agent of cfg.agents) {
-        if (!agent?.name || !agent.runner) throw new Error(`remote-agents: each agent needs { name, runner } in ${path}`);
-        if (!cfg.runners[agent.runner]) {
-            throw new Error(`remote-agents: agent "${agent.name}" references unknown runner "${agent.runner}" in ${path}`);
-        }
-    }
     for (const [name, runner] of Object.entries(cfg.runners)) {
         if (typeof runner?.type !== "string" || !RUNNER_TYPES[runner.type]) {
             throw new Error(
@@ -90,7 +76,7 @@ function readJson(path: string): RemoteAgentsConfig {
             );
         }
     }
-    return { defaultRunner: cfg.defaultRunner, agents: cfg.agents as AgentEntry[], runners: cfg.runners as Record<string, RunnerConfig> };
+    return { defaultRunner: cfg.defaultRunner, runners: cfg.runners as Record<string, RunnerConfig> };
 }
 
 export function loadRemoteAgentsConfig(cwd = process.cwd(), home = homedir()): RemoteAgentsConfig | undefined {
@@ -103,7 +89,6 @@ export function loadRemoteAgentsConfig(cwd = process.cwd(), home = homedir()): R
         const project = readJson(projectPath);
         return {
             defaultRunner: project.defaultRunner ?? cfg.defaultRunner,
-            agents: [...cfg.agents, ...project.agents],
             runners: { ...cfg.runners, ...project.runners },
         };
     }

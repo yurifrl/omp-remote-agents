@@ -18,6 +18,10 @@ export interface ExecOptions {
     signal?: AbortSignal;
     timeoutMs?: number;
     stdin?: string;
+    /** Called with each decoded stdout chunk as it arrives (live progress). */
+    onStdoutChunk?: (chunk: string) => void;
+    /** Called with each decoded stderr chunk as it arrives (live progress). */
+    onStderrChunk?: (chunk: string) => void;
 }
 
 export async function runCommand(argv: string[], opts: ExecOptions = {}): Promise<ExecResult> {
@@ -60,8 +64,8 @@ export async function runCommand(argv: string[], opts: ExecOptions = {}): Promis
             })().catch(() => {}) // stdin failures don't matter once the child is dying
             : undefined;
         const [stdout, stderr] = await Promise.all([
-            new Response(proc.stdout).text(),
-            new Response(proc.stderr).text(),
+            new Response(opts.onStdoutChunk ? streamStdout(proc.stdout, opts.onStdoutChunk) : proc.stdout).text(),
+            new Response(opts.onStderrChunk ? streamStdout(proc.stderr, opts.onStderrChunk) : proc.stderr).text(),
             writePromise,
         ]);
         const exitCode = await proc.exited;
@@ -70,6 +74,23 @@ export async function runCommand(argv: string[], opts: ExecOptions = {}): Promis
         clearTimeout(timer);
         opts.signal?.removeEventListener("abort", onAbort);
     }
+}
+
+/** Decoded-readable passthrough that forwards each chunk to `onChunk`. */
+function streamStdout(source: ReadableStream<Uint8Array>, onChunk: (chunk: string) => void): ReadableStream<Uint8Array> {
+    const decoder = new TextDecoder();
+    const wrapped = source.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) {
+            onChunk(decoder.decode(chunk, { stream: true }));
+            controller.enqueue(chunk);
+        },
+        flush(controller) {
+            const rest = decoder.decode();
+            if (rest) onChunk(rest);
+            controller.terminate();
+        },
+    }));
+    return wrapped;
 }
 
 /** POSIX single-quote escape for embedding strings in `sh -c` scripts. */

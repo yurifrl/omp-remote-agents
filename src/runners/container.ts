@@ -76,6 +76,8 @@ export function createContainerRunner(cfg: ContainerRunnerConfig, home: string):
                     signal: opts.signal,
                     timeoutMs,
                     cwd: spec.cwd,
+                    onStdoutChunk: opts.onUpdate,
+                    onStderrChunk: opts.onUpdate,
                 });
                 opts.onUpdate?.(res.exitCode === 0 ? "remote-agents: container run finished" : `remote-agents: container run exited with code ${res.exitCode}`);
                 return {

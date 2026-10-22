@@ -1,44 +1,51 @@
 # omp-remote-agents
 
-omp extension: shadows the native `task` tool and routes configured subagents to
-**remote runtimes** (Apple Containers, Kubernetes, generic commands) behind a
-swappable runner port.
+omp extension: run delegated subagent work in **remote runtimes** (Apple
+Containers, Kubernetes, generic commands) while keeping omp's native `task`
+experience — agent rows in the Tern UI, background execution, `agent://`
+output, parent steering.
 
-## Why
+## How it works
 
-omp's native `task` tool spawns subagents in-process. This extension keeps the
-exact same model-facing surface (same tool name, same `tasks[]` schema, same
-`agent://`-style delegation flow) but executes delegated work inside an
-isolated runtime of your choice. The runner is a port (`RemoteRunner`), not a
-hardcoded backend — plugging a future runtime means implementing one interface
-or adding one config entry, never touching the extension core.
+Native `task` stays in charge. This package adds two things:
+
+1. **`remote_run` tool** — resolves a runner from config and executes the
+   assignment as a headless `omp -p <task>` session inside the runtime.
+2. **`remote-*` proxy agents** (`remote-container`, `remote-k8s`,
+   `remote-command`) — native task agents whose only job is to forward their
+   assignment to `remote_run` and relay the result. Delegating to one of them
+   via `task` gives you a real subagent: Tern agent row, live progress,
+   `agent://` output, steerable.
+
+The runner is a port (`RemoteRunner`), not a hardcoded backend — plugging a
+future runtime means implementing one interface, never touching the extension
+core.
 
 ## Install
 
 ```bash
-ln -s /Users/yuri/DotFiles/pi-extentions/omp-remote-agents ~/.omp/agent/extensions/omp-remote-agents
+# 1. Module: symlink the package into the auto-discovered extensions dir
+ln -s /path/to/omp-remote-agents ~/.omp/agent/extensions/omp-remote-agents
+
+# 2. Proxy agents: symlink the shipped agents/ into the user agents dir
+ln -s /path/to/omp-remote-agents/agents/remote-container.md ~/.omp/agent/agents/remote-container.md
+ln -s /path/to/omp-remote-agents/agents/remote-k8s.md ~/.omp/agent/agents/remote-k8s.md
+ln -s /path/to/omp-remote-agents/agents/remote-command.md ~/.omp/agent/agents/remote-command.md
 ```
 
-Discovery is via the package manifest (`package.json#omp.extensions`). The
-global toggle file `~/.omp/agent/extensions/remote-agents.json` (pre-existing)
-is unrelated loose JSON and is ignored by auto-discovery.
+(Instead of step 2, the whole package dir can be listed in the settings
+`extensions:` array — extension packages' `agents/` dirs are discovered from
+those roots. The explicit user-agents-dir symlinks are the reliable path.)
 
 ## Configuration
 
-Global: `~/.omp/agent/remote-agents.json`. Project overlay: `./.omp/remote-agents.json`
-(agents append, runners merge by name, `defaultRunner` prefers the project).
+Global: `~/.omp/agent/remote-agents.json`. Project overlay:
+`./.omp/remote-agents.json` (runners merge by name, project `defaultRunner`
+wins).
 
 ```jsonc
 {
-    "defaultRunner": "container",   // optional: route agentless task items remotely
-    "agents": [
-        {
-            "name": "scout",              // native agent name in ~/.omp/agent/agents/
-            "description": "fast recon",  // surface in tool description docs
-            "runner": "container",        // which runner entry to use
-            "model": "zai/glm-5.3-flash"  // optional default model for its runs
-        }
-    ],
+    "defaultRunner": "container",   // optional: runner used when remote_run omits `runner`
     "runners": {
         "container": {
             "type": "container",
@@ -73,20 +80,9 @@ Global: `~/.omp/agent/remote-agents.json`. Project overlay: `./.omp/remote-agent
 }
 ```
 
-## Routing
-
-Per `task` item:
-
-1. `item.agent` names a configured agent → that agent's runner.
-2. No agent, but `defaultRunner` set → default runner (remote becomes the
-   default delegation target).
-3. Anything else (unknown agent, no config file) → native `task` behavior via
-   `ctx.invokeTool` delegation.
-
-`item.async: true` detaches the run: the tool returns immediately with a run id
-and the result arrives later as a steered `remote-agents-result` message
-(`deliverAs: "nextTurn", triggerTurn: true` — wakes an idle parent, queues
-behind a streaming one).
+`remote_run` runner resolution: explicit `runner` param → `defaultRunner` →
+the single configured runner. Anything else errors listing the configured
+names.
 
 ## What runs inside the runtime
 
@@ -95,35 +91,27 @@ behind a streaming one).
 - `container` — stages `~/.omp/agent` (config.yml, models.yml, settings.json,
   agents/*.md, auth/*) into a temp dir mounted at `/agent`; host cwd is
   bind-mounted read-write at `/work` (the remote agent can do real work).
-  Model comes from staged `models.yml` unless `-m` is passed.
-- `k8s` — stages flat config files as a ConfigMap, runs the pod, streams logs
-  as output; cleans up pod + ConfigMap afterwards. Cannot mount the host cwd
-  (PoC limitation).
+  Model comes from staged `models.yml` unless `-m` is passed. stdout/stderr
+  stream back as live tool progress.
+- `k8s` — stages flat config files as a ConfigMap, runs the pod with resource
+  limits, streams logs as output; cleans up pod + ConfigMap afterwards.
+  Cannot mount the host cwd.
 - `command` — no staging; you own the environment.
 
 ## Verification
 
 ```bash
-bun run smoke:load              # offline: factory loads, task shadow registers, schema parses
+bun run smoke:load              # offline: remote_run registers, schema parses, command runner executes, proxy agents parse
 bun run smoke:container         # stage-1: staging/mount/perms/capture in real Apple container
 bun run smoke:container -- --e2e # stage-2: full omp-in-container turn (slow first run)
 ```
 
-Verified live (2026-10-21):
+## Known gaps
 
-- session loads with extension; model sees the shadow's tool description
-- `bun run smoke:container -- --e2e` — omp inside `oven/bun` answered `pong`
-- headless delegation through the shadow to agent `container-echo`
-
-## Known gaps (PoC)
-
-- `agent`-kind background rows: the extension streams progress via tool-card
-  `details`, but cannot synthesize native bus events — async runs render as
-  tool-card rows, not native Agent Hub rows.
+- k8s adapter untested against a live cluster.
+- k8s pods cannot mount the host cwd — workdir contents are unavailable
+  inside the pod.
 - No orphan cleanup if the host dies mid-run: `container run --rm` cleanup
   relies on the CLI process surviving; k8s cleanup is in the `finally` path.
-- k8s adapter cannot mount the host cwd — workdir contents are unavailable
-  inside the pod.
-- Extension `task` replacement covers the common path; runner-side timeouts
-  kill the CLI but remote pids inside an already-created VM/pod are only
-  bounded by the runtime itself.
+- Runner-side timeouts kill the CLI but remote pids inside an
+  already-created VM/pod are only bounded by the runtime itself.
