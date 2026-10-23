@@ -19,16 +19,32 @@ import { tmpdir } from "node:os";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { AxRunnerConfig } from "../config.ts";
-import { resolvePassthroughEnv } from "../registry.ts";
 import { runCommand, shq } from "../subprocess.ts";
 import type { RemoteRunner, RunnerResult, RunnerSpawnSpec, SpawnOptions } from "../types.ts";
 
 const DEFAULT_TIMEOUT_MS = 20 * 60_000;
 const RESULT_FILE = "/workspace/omp-result.txt";
 const RESULT_DONE = "OMP_RESULT_DONE";
-const POLL_INTERVAL_MS = 5_000;
+/** Poll cadence for status and result checks; OMP_AX_POLL_MS overrides for offline smokes. */
+const POLL_INTERVAL_MS = Number(process.env.OMP_AX_POLL_MS ?? 5_000);
 /** env-embedded tarball ceiling; beyond this the manifest becomes unwieldy. */
 const MAX_WORKDIR_B64 = 6 * 1024 * 1024;
+
+/** Resolve env-passthrough patterns (exact name or `*` glob, e.g. `*_API_KEY`) against the parent env. */
+export function resolvePassthroughEnv(patterns: string[], env = process.env): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const key of Object.keys(env)) {
+        for (const pattern of patterns) {
+            const [prefix, suffix] = pattern.split("*", 2);
+            const matches = pattern.includes("*") ? key.startsWith(prefix) && key.endsWith(suffix) : key === pattern;
+            if (matches) {
+                out[key] = env[key]!;
+                break;
+            }
+        }
+    }
+    return out;
+}
 
 function b64(text: string): string {
     return Buffer.from(text, "utf8").toString("base64");
@@ -64,7 +80,7 @@ function buildScript(env: Record<string, string>, model: string | undefined, tas
     ].join("\n");
 }
 
-export function createAxRunner(cfg: AxRunnerConfig, home: string): RemoteRunner {
+export function createAxRunner(cfg: AxRunnerConfig): RemoteRunner {
     const axBase = ["ax", ...(cfg.ax ?? []), "-n", cfg.namespace ?? "ax-system"];
 
     return {

@@ -1,17 +1,17 @@
 /**
- * remote-agents — registers the `remote_run` tool and ships `remote-*` proxy
- * agents that the native task subsystem discovers from this package's agents/
- * dir. A proxy agent forwards its assignment to a configured runner (Apple
- * Containers, Kubernetes, or a generic command); native task owns spawning,
- * backgrounding, agent:// output, and the Tern agent UI. This module only
- * resolves the runner and shapes the run result.
+ * remote-agents — registers the `remote_run` tool and ships the `remote-ax`
+ * proxy agent that the native task subsystem discovers from this package's
+ * agents/ dir. The proxy agent forwards its assignment to the ax runner
+ * (agent-substrate gvisor actor); native task owns spawning, backgrounding,
+ * agent:// output, and the Tern agent UI. This module only resolves the
+ * runner and shapes the run result.
  */
 
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { loadRemoteAgentsConfig } from "../src/config.ts";
-import { createRunner } from "../src/registry.ts";
+import { createAxRunner } from "../src/runners/ax.ts";
 
 const SUMMARY_LIMIT = 8_000;
 const UPDATE_INTERVAL_MS = 1_000;
@@ -27,8 +27,8 @@ export default function (pi: ExtensionAPI) {
         name: "remote_run",
         label: "Remote Run",
         description: [
-            "Run one headless omp session on a remote runtime (Apple Container VM, Kubernetes pod, or generic command).",
-            "Internal to the remote-* proxy agents — delegate work via the task tool with agent `remote-container` (or `remote-k8s`/`remote-command`) instead of calling this directly.",
+            "Run one headless omp session on the agent-substrate (ax) platform as a gVisor sandbox actor.",
+            "Internal to the remote-ax proxy agent — delegate work via the task tool with agent `remote-ax` instead of calling this directly.",
         ].join(" "),
         parameters: z.object({
             runner: z.string().optional().describe(
@@ -53,7 +53,7 @@ export default function (pi: ExtensionAPI) {
             }
 
             const runId = randomUUID().slice(0, 8);
-            const runner = createRunner(runnerCfg, homedir());
+            const runner = createAxRunner(runnerCfg, homedir());
 
             let lastEmit = 0;
             let buffer = "";

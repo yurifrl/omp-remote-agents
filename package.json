@@ -1,7 +1,7 @@
 {
   "name": "omp-remote-agents",
-  "version": "0.1.0",
-  "description": "omp extension: run subagent tasks in remote runtimes (Apple Containers, Kubernetes, generic commands) behind a swappable runner port",
+  "version": "0.2.0",
+  "description": "omp extension: run delegated subagent work on the ax (agent-substrate) platform behind omp's native task flow",
   "type": "module",
   "omp": {
     "extensions": [
@@ -9,8 +9,7 @@
     ]
   },
   "scripts": {
-    "smoke:load": "bun run scripts/smoke-load.ts",
-    "smoke:container": "bun run scripts/smoke-container.ts"
+    "smoke:load": "bun run scripts/smoke-load.ts"
   },
   "devDependencies": {
     "zod": "^4.6.7"

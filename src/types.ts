@@ -1,14 +1,14 @@
 /**
  * Runner port: the seam between omp's task delegation and any remote runtime.
  * Adapters implement `RemoteRunner`; the extension maps configured agent names
- * to runners. Adding a future runtime = implementing this interface (or using
- * the `command` generic adapter via config), never touching the extension core.
+ * to runners. Adding a future runtime = implementing this interface, never
+ * touching the extension core.
  */
 
 export interface RunnerSpawnSpec {
-    /** Unique run id (used as container/pod name suffix). */
+    /** Unique run id (used as ax Task name suffix). */
     id: string;
-    /** Agent name from remote-agents.json (e.g. "remote-container"). */
+    /** Agent name from remote-agents.json (e.g. "remote-ax"). */
     agent: string;
     /** Display label (task item `name`, falls back to agent name). */
     name: string;
@@ -39,7 +39,7 @@ export interface SpawnOptions {
 }
 
 export interface RemoteRunner {
-    /** Adapter kind, mirrors RunnerConfig.type. */
+    /** Adapter kind, mirrors the configured runner entry's type. */
     readonly type: string;
     spawn(spec: RunnerSpawnSpec, opts?: SpawnOptions): Promise<RunnerResult>;
 }

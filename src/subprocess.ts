@@ -1,7 +1,7 @@
 /**
  * Minimal Bun.spawn wrapper: capture stdout/stderr, honor abort signal and
  * timeout, optional stdin payload. Env defaults to the parent environment
- * (runner CLIs like `container`/`kubectl` need the caller's credentials).
+ * (runner CLIs like `ax` need the caller's credentials).
  */
 
 export interface ExecResult {
@@ -18,10 +18,6 @@ export interface ExecOptions {
     signal?: AbortSignal;
     timeoutMs?: number;
     stdin?: string;
-    /** Called with each decoded stdout chunk as it arrives (live progress). */
-    onStdoutChunk?: (chunk: string) => void;
-    /** Called with each decoded stderr chunk as it arrives (live progress). */
-    onStderrChunk?: (chunk: string) => void;
 }
 
 export async function runCommand(argv: string[], opts: ExecOptions = {}): Promise<ExecResult> {
