@@ -22,7 +22,12 @@ for a in "$@"; do
   esac
 done
 case "$verb" in
-  apply) exit 0 ;;
+  apply)
+    # Mirror the substrate guardrail: reject env values over 32768 chars.
+    if grep -qE 'value: .{32769,}' "$3" 2>/dev/null; then
+      printf 'stub ax: env value exceeds limit\\n' >&2; exit 1
+    fi
+    exit 0 ;;
   resume) exit 0 ;;
   get) printf 'phase: Running\\n' ;;
   ssh) printf 'ax-noise\\n===OMP_RESULT===\\nsmoke-ok\\n__OMP_EXIT__=0\\n===OMP_STDERR===\\nno-stderr\\nOMP_RESULT_DONE\\n' ;;
