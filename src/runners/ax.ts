@@ -1,20 +1,29 @@
 /**
  * ax adapter: runs the remote omp as an ax Task on the agent-substrate
  * platform (gvisor sandbox actors on the home Talos cluster). Lifecycle:
- * `ax apply -f -` (Task → Suspended, actor provisioned) → `ax resume task`
- * (Running; ax-task-runner execs spec.command) → output polled via
- * `ax ssh -- cat <file>` → `ax delete task` cleanup in finally.
+ * `ax apply -f <stub>` (Task → Suspended, actor provisioned) → `ax resume task`
+ * (Running; ax-task-runner execs spec.command) → payload staged via one
+ * `ax ssh` stdin stream → output polled via `ax ssh -- cat <file>` →
+ * `ax delete task` cleanup in finally.
  *
- * Output plumbing: ax has no log capture, so the command writes its result
- * to /workspace/omp-result.txt with sentinel delimiters; the adapter polls
- * ssh cat until the sentinel appears. The command itself is base64-embedded
- * shell (the task prompt contains arbitrary text — never interpolated raw
- * into the YAML manifest). The ax-task-runner keeps the sandbox alive after
- * the command exits, so late polls still succeed before delete.
+ * The applied manifest is a tiny fixed stub. Substrate guards every
+ * ActorTemplate `EnvVar.value` at 32768 chars, and ax's reconciler embeds the
+ * whole Task YAML (spec.command included) into the actor's AX_TASK_YAML env —
+ * so anything sizeable in the manifest is rejected server-side. The payload
+ * (workdir tar + entry script) therefore travels as a single tar.gz streamed
+ * over `ax ssh` stdin: guest exec copies stdin and closes it at EOF, no env
+ * guardrail applies. The stub boot script waits for the staged marker, then
+ * execs the entry script.
+ *
+ * Output plumbing: ax has no log capture, so the entry script writes its
+ * result to /workspace/omp-result.txt with sentinel delimiters; the adapter
+ * polls ssh cat until the sentinel appears. The ax-task-runner keeps the
+ * sandbox alive after the command exits, so late polls still succeed before
+ * delete.
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -27,8 +36,28 @@ const RESULT_FILE = "/workspace/omp-result.txt";
 const RESULT_DONE = "OMP_RESULT_DONE";
 /** Poll cadence for status and result checks; OMP_AX_POLL_MS overrides for offline smokes. */
 const POLL_INTERVAL_MS = Number(process.env.OMP_AX_POLL_MS ?? 5_000);
-/** env-embedded tarball ceiling; beyond this the manifest becomes unwieldy. */
-const MAX_WORKDIR_B64 = 6 * 1024 * 1024;
+
+/** Stage archive path inside the guest, plus the ready marker the boot stub waits on. */
+const STAGE_TGZ = "/workspace/omp-staged.tgz";
+const STAGE_READY = "/workspace/omp-staged-ready";
+
+/** Fixed boot script shipped in the Task manifest (kept tiny: it lands inside AX_TASK_YAML). */
+const BOOT_STUB = `
+i=0
+while [ ! -f ${STAGE_READY} ] && [ "$i" -lt 600 ]; do
+  sleep 1
+  i=$((i + 1))
+done
+if [ ! -f /workspace/omp-entry.sh ]; then
+  printf '__OMP_EXIT__=1\\n'
+  { echo '===OMP_RESULT==='; echo 'staging timeout: payload never arrived'; echo 'OMP_RESULT_DONE'; } > ${RESULT_FILE}
+  exit 1
+fi
+sh /workspace/omp-entry.sh
+`;
+
+/** Remote side of the staging ssh: consume the archive from stdin, extract, mark ready. */
+const STAGE_REMOTE = `cat > ${STAGE_TGZ} && tar -xzf ${STAGE_TGZ} -C /workspace && touch ${STAGE_READY}`;
 
 /** Resolve env-passthrough patterns (exact name or `*` glob, e.g. `*_API_KEY`) against the parent env. */
 export function resolvePassthroughEnv(patterns: string[], env = process.env): Record<string, string> {
@@ -46,10 +75,6 @@ export function resolvePassthroughEnv(patterns: string[], env = process.env): Re
     return out;
 }
 
-function b64(text: string): string {
-    return Buffer.from(text, "utf8").toString("base64");
-}
-
 function delay(ms: number): Promise<void> {
     const { promise, resolve } = Promise.withResolvers<void>();
     setTimeout(resolve, ms);
@@ -57,8 +82,8 @@ function delay(ms: number): Promise<void> {
 }
 
 /**
- * The shell executed inside the sandbox: exports passthrough env, unpacks
- * the staged workdir tarball, runs headless omp, then writes a
+ * The entry script delivered inside the stage archive: exports passthrough
+ * env, unpacks the staged workdir tarball, runs headless omp, then writes a
  * sentinel-delimited result file (stdout tail + stderr tail + exit code).
  */
 function buildScript(env: Record<string, string>, model: string | undefined, task: string): string {
@@ -69,7 +94,7 @@ function buildScript(env: Record<string, string>, model: string | undefined, tas
         "set -u",
         "mkdir -p /workspace/omp-work /agent-home",
         "export HOME=/agent-home",
-        "tar -xzf /workspace/omp-workdir.tgz -C /workspace/omp-work",
+        "tar -xzf /workspace/workdir.tgz -C /workspace/omp-work",
         "cd /workspace/omp-work",
         envExports,
         `bun x @oh-my-pi/pi-coding-agent@latest -p ${shq(task)}${model ? ` --model ${shq(model)}` : ""} > /workspace/omp-stdout.txt 2> /workspace/omp-stderr.txt`,
@@ -93,6 +118,7 @@ export function createAxRunner(cfg: AxRunnerConfig): RemoteRunner {
             const model = spec.model ?? cfg.model;
 
             const stage = mkdtempSync(join(tmpdir(), "omp-ax-"));
+            const payload = join(stage, "payload");
             const onUpdate = opts.onUpdate;
             let lastEmit = 0;
             const throttled = (msg: string) => {
@@ -104,10 +130,11 @@ export function createAxRunner(cfg: AxRunnerConfig): RemoteRunner {
             };
 
             try {
-                // Stage the host cwd as a tarball embedded in the command
-                // (the sandbox has no access to host paths).
+                // Pack the host cwd (the sandbox has no access to host paths)
+                // and bundle it with the entry script into one archive.
                 throttled(`packing workdir ${spec.cwd}`);
-                const workdirTgz = join(stage, "workdir.tgz");
+                mkdirSync(payload, { recursive: true });
+                const workdirTgz = join(payload, "workdir.tgz");
                 const tarRes = await runCommand(["tar", "-czf", workdirTgz, "-C", spec.cwd, "."], {
                     timeoutMs: 120_000,
                     signal: opts.signal,
@@ -115,20 +142,15 @@ export function createAxRunner(cfg: AxRunnerConfig): RemoteRunner {
                 if (tarRes.exitCode !== 0) {
                     return fail(tarRes, `tar of ${spec.cwd} failed`);
                 }
-                const workdirB64 = readFileSync(workdirTgz).toString("base64");
-                if (workdirB64.length > MAX_WORKDIR_B64) {
-                    return fail({ stderr: `workdir ${spec.cwd} too large to stage (${(workdirB64.length / 1e6).toFixed(1)} MB base64 > 6 MB cap)`, stdout: "", exitCode: null });
-                }
+                writeFileSync(join(payload, "omp-entry.sh"), buildScript(env, model, spec.task), { mode: 0o755 });
+                const stageTgz = join(stage, "omp-staged.tgz");
+                const packRes = await runCommand(["tar", "-czf", stageTgz, "-C", payload, "."], {
+                    timeoutMs: 120_000,
+                    signal: opts.signal,
+                });
+                if (packRes.exitCode !== 0) return fail(packRes, "staging archive packing failed");
 
-                const script = buildScript(env, model, spec.task);
-                const commandPayload = b64(
-                    [
-                        `echo ${shq(workdirB64)} | base64 -d > /workspace/omp-workdir.tgz`,
-                        `echo ${shq(b64(script))} | base64 -d > /workspace/omp-entry.sh`,
-                        "sh /workspace/omp-entry.sh",
-                    ].join("\n"),
-                );
-
+                // Tiny manifest: command is the fixed BOOT_STUB, never the payload.
                 const manifest = [
                     "---",
                     "apiVersion: ax.io/v1alpha1",
@@ -141,8 +163,8 @@ export function createAxRunner(cfg: AxRunnerConfig): RemoteRunner {
                     "  command:",
                     "    - /bin/sh",
                     "    - -c",
-                    "    - |",
-                    ...commandPayload.split("\n").map((line) => `      ${line}`),
+                    "    - |-",
+                    ...BOOT_STUB.trim().split("\n").map((line) => `      ${line}`),
                     "  debug: true",
                     "",
                 ].join("\n");
@@ -178,10 +200,9 @@ export function createAxRunner(cfg: AxRunnerConfig): RemoteRunner {
                     return fail(resumeRes);
                 }
 
-                // Poll for the sentinel via ax ssh (guest exec over atenet).
-                // ssh requires phase Running: resume completes asynchronously
-                // on the server (wakeup probe, golden restore), so first wait
-                // for the phase gate.
+                // Wait for the phase gate: ssh requires phase Running.
+                // resume completes asynchronously on the server (wakeup probe,
+                // golden restore), so poll until the actor is up.
                 const deadline = Date.now() + timeoutMs;
                 let running = false;
                 let resumed = false;
@@ -220,6 +241,19 @@ export function createAxRunner(cfg: AxRunnerConfig): RemoteRunner {
                         timedOut: true,
                     };
                 }
+
+                // Stage the payload: one ssh exec whose stdin is the archive;
+                // EOF closes the remote `cat`, which then extracts and marks
+                // the stub boot script ready to run the entry script.
+                const stageBytes = new Uint8Array(await Bun.file(stageTgz).arrayBuffer());
+                throttled(`staging payload (${(stageBytes.byteLength / 1e6).toFixed(1)} MB) via ax ssh`);
+                const stageRes = await runCommand([...axBase, "ssh", taskName, "--", "sh", "-c", STAGE_REMOTE], {
+                    stdin: stageBytes,
+                    timeoutMs: 300_000,
+                    signal: opts.signal,
+                });
+                if (stageRes.exitCode !== 0) return fail(stageRes, "staging payload via ax ssh failed");
+
                 let resultText = "";
                 let exitCode: number | null = null;
                 let stderrTail = "";

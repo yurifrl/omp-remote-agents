@@ -17,7 +17,8 @@ export interface ExecOptions {
     env?: Record<string, string>;
     signal?: AbortSignal;
     timeoutMs?: number;
-    stdin?: string;
+    /** String or binary payload piped to the child's stdin (closed at EOF). */
+    stdin?: string | Uint8Array;
 }
 
 export async function runCommand(argv: string[], opts: ExecOptions = {}): Promise<ExecResult> {
@@ -54,9 +55,13 @@ export async function runCommand(argv: string[], opts: ExecOptions = {}): Promis
     try {
         const writePromise = opts.stdin !== undefined
             ? (async () => {
-                const writer = proc.stdin.getWriter();
-                await writer.write(new TextEncoder().encode(opts.stdin!));
-                await writer.close();
+                // Bun's stdin is a FileSink, not a web WritableStream.
+                if (typeof opts.stdin === "string") {
+                    proc.stdin.write(new TextEncoder().encode(opts.stdin));
+                } else {
+                    proc.stdin.write(opts.stdin);
+                }
+                await proc.stdin.end();
             })().catch(() => {}) // stdin failures don't matter once the child is dying
             : undefined;
         const [stdout, stderr] = await Promise.all([

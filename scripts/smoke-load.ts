@@ -14,7 +14,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const STUB_AX = `#!/bin/sh
-# Emulates the ax CLI verbs the runner exercises.
+# Emulates the ax CLI verbs the runner exercises, including the two-ssh
+# lifecycle: apply (tiny manifest) → resume → get → ssh stage (stdin) →
+# ssh cat (result poll) → delete.
 verb=
 for a in "$@"; do
   case "$a" in
@@ -23,14 +25,36 @@ for a in "$@"; do
 done
 case "$verb" in
   apply)
-    # Mirror the substrate guardrail: reject env values over 32768 chars.
-    if grep -qE 'value: .{32769,}' "$3" 2>/dev/null; then
-      printf 'stub ax: env value exceeds limit\\n' >&2; exit 1
+    # Mirror the substrate guardrail: the reconciler embeds the whole Task
+    # YAML into the actor's AX_TASK_YAML env, capped at 32768 chars.
+    f=
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -f|--file) f="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    [ -n "$f" ] || { printf 'stub ax: apply missing -f\\n' >&2; exit 1; }
+    size=$(wc -c < "$f" | tr -d ' ')
+    if [ "$size" -gt 32768 ]; then
+      printf 'stub ax: manifest %s bytes exceeds AX_TASK_YAML 32KiB guardrail\\n' "$size" >&2
+      exit 1
     fi
+    printf 'manifest-bytes:%s\\n' "$size" >> "\${SMOKE_AX_LOG:?}"
     exit 0 ;;
   resume) exit 0 ;;
   get) printf 'phase: Running\\n' ;;
-  ssh) printf 'ax-noise\\n===OMP_RESULT===\\nsmoke-ok\\n__OMP_EXIT__=0\\n===OMP_STDERR===\\nno-stderr\\nOMP_RESULT_DONE\\n' ;;
+  ssh)
+    case "$*" in
+      *omp-staged.tgz*)
+        cat > "\${SMOKE_STAGE_FILE:?}"
+        printf 'staged:%s\\n' "$(wc -c < "\${SMOKE_STAGE_FILE:?}" | tr -d ' ')" >> "\${SMOKE_AX_LOG:?}"
+        ;;
+      *)
+        printf 'ax-noise\\n===OMP_RESULT===\\nsmoke-ok\\n__OMP_EXIT__=0\\n===OMP_STDERR===\\nno-stderr\\nOMP_RESULT_DONE\\n'
+        ;;
+    esac
+    exit 0 ;;
   delete) printf 'deleted %s\\n' "$*" >> "\${SMOKE_AX_LOG:?}"; exit 0 ;;
   *) printf 'stub ax: unexpected argv: %s\\n' "$*" >&2; exit 99 ;;
 esac
@@ -46,12 +70,14 @@ if (!process.env.SMOKE_CHILD) {
     );
     writeFileSync(join(stubDir, "ax"), STUB_AX, { mode: 0o755 });
     const axLog = join(home, "ax-stub.log");
+    const stageFile = join(home, "stage-received.bin");
     const child = Bun.spawn(["bun", import.meta.path], {
         env: {
             ...process.env,
             HOME: home,
             SMOKE_CHILD: "1",
             SMOKE_AX_LOG: axLog,
+            SMOKE_STAGE_FILE: stageFile,
             PATH: `${stubDir}:${process.env.PATH ?? ""}`,
             OMP_AX_POLL_MS: "50",
         },
@@ -121,8 +147,19 @@ for (const params of [{ task: "ping", runner: "ax" }, { task: "ping" }]) {
     assert.equal(res.details.exitCode, 0);
 }
 
-// 4. Cleanup ran: the stub recorded the delete verb.
-assert.match(readFileSync(process.env.SMOKE_AX_LOG!, "utf8"), /deleted/);
+// 4. Cleanup ran and the new staged lifecycle exercised: the stub recorded
+//    the delete verb, a sub-32KiB manifest, and a binary stage stream.
+const log = readFileSync(process.env.SMOKE_AX_LOG!, "utf8");
+assert.match(log, /deleted/);
+const manifestBytes = Number(log.match(/manifest-bytes:(\d+)/)?.[1]);
+assert.ok(manifestBytes > 0 && manifestBytes <= 32768, `manifest ${manifestBytes}B must pass the 32KiB AX_TASK_YAML guardrail`);
+assert.ok(manifestBytes < 1024, `stub manifest should be tiny, got ${manifestBytes}B`);
+const stagedBytes = Number(log.match(/staged:(\d+)/)?.[1]);
+assert.ok(stagedBytes > 1000, `staging ssh must have streamed the archive, got ${stagedBytes}B`);
+const stagedFile = process.env.SMOKE_STAGE_FILE!;
+const members = await new Response(Bun.spawn(["tar", "-tzf", stagedFile]).stdout as ReadableStream).text();
+assert.match(members, /omp-entry\.sh/, "stage archive must carry the entry script");
+assert.match(members, /workdir\.tgz/, "stage archive must carry the workdir");
 
 // 5. Shipped proxy agent parses and references remote_run.
 const agentsDir = join(import.meta.dir, "..", "agents");
@@ -132,4 +169,4 @@ const md = readFileSync(join(agentsDir, "remote-ax.md"), "utf8");
 assert.match(md, /^---\nname: remote-ax\n/);
 assert.match(md, /remote_run/);
 
-console.log("smoke:load OK — remote_run registered, schema validated, ax lifecycle ran against stub CLI, cleanup verified, remote-ax agent present");
+console.log("smoke:load OK — remote_run registered, schema validated, stub ax lifecycle (apply→resume→ssh stage→cat poll→delete) ran with a tiny manifest and streamed payload, cleanup verified, remote-ax agent present");
