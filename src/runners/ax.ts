@@ -57,7 +57,7 @@ sh /workspace/omp-entry.sh
 `;
 
 /** Remote side of the staging ssh: consume the archive from stdin, extract, mark ready. */
-const STAGE_REMOTE = `cat > ${STAGE_TGZ} && tar -xzf ${STAGE_TGZ} -C /workspace && touch ${STAGE_READY}`;
+const STAGE_REMOTE = `cat > ${STAGE_TGZ} && tar -xzf ${STAGE_TGZ} -C /workspace --no-same-owner && touch ${STAGE_READY}`;
 
 /** Resolve env-passthrough patterns (exact name or `*` glob, e.g. `*_API_KEY`) against the parent env. */
 export function resolvePassthroughEnv(patterns: string[], env = process.env): Record<string, string> {
@@ -94,7 +94,7 @@ function buildScript(env: Record<string, string>, model: string | undefined, tas
         "set -u",
         "mkdir -p /workspace/omp-work /agent-home",
         "export HOME=/agent-home",
-        "tar -xzf /workspace/workdir.tgz -C /workspace/omp-work",
+        "tar -xzf /workspace/workdir.tgz -C /workspace/omp-work --no-same-owner",
         "cd /workspace/omp-work",
         envExports,
         `bun x @oh-my-pi/pi-coding-agent@latest -p ${shq(task)}${model ? ` --model ${shq(model)}` : ""} > /workspace/omp-stdout.txt 2> /workspace/omp-stderr.txt`,
@@ -135,10 +135,10 @@ export function createAxRunner(cfg: AxRunnerConfig): RemoteRunner {
                 throttled(`packing workdir ${spec.cwd}`);
                 mkdirSync(payload, { recursive: true });
                 const workdirTgz = join(payload, "workdir.tgz");
-                const tarRes = await runCommand(["tar", "-czf", workdirTgz, "-C", spec.cwd, "."], {
-                    timeoutMs: 120_000,
-                    signal: opts.signal,
-                });
+                const tarRes = await runCommand(
+                    ["env", "COPYFILE_DISABLE=1", "tar", "--no-xattrs", "-czf", workdirTgz, "-C", spec.cwd, "."],
+                    { timeoutMs: 120_000, signal: opts.signal },
+                );
                 if (tarRes.exitCode !== 0) {
                     return fail(tarRes, `tar of ${spec.cwd} failed`);
                 }
@@ -244,14 +244,26 @@ export function createAxRunner(cfg: AxRunnerConfig): RemoteRunner {
 
                 // Stage the payload: one ssh exec whose stdin is the archive;
                 // EOF closes the remote `cat`, which then extracts and marks
-                // the stub boot script ready to run the entry script.
+                // the stub boot script ready to run the entry script. Each
+                // `ax` invocation may spin up an ephemeral tunnel whose
+                // health check races the connection (transient), so retry
+                // with fresh bytes until it sticks.
                 const stageBytes = new Uint8Array(await Bun.file(stageTgz).arrayBuffer());
                 throttled(`staging payload (${(stageBytes.byteLength / 1e6).toFixed(1)} MB) via ax ssh`);
-                const stageRes = await runCommand([...axBase, "ssh", taskName, "--", "sh", "-c", STAGE_REMOTE], {
+                let stageRes = await runCommand([...axBase, "ssh", taskName, "--", "sh", "-c", STAGE_REMOTE], {
                     stdin: stageBytes,
                     timeoutMs: 300_000,
                     signal: opts.signal,
                 });
+                for (let attempt = 1; attempt < 3 && stageRes.exitCode !== 0; attempt++) {
+                    throttled("staging failed; retrying");
+                    await delay(2_000);
+                    stageRes = await runCommand([...axBase, "ssh", taskName, "--", "sh", "-c", STAGE_REMOTE], {
+                        stdin: stageBytes,
+                        timeoutMs: 300_000,
+                        signal: opts.signal,
+                    });
+                }
                 if (stageRes.exitCode !== 0) return fail(stageRes, "staging payload via ax ssh failed");
 
                 let resultText = "";
