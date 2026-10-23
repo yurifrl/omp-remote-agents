@@ -61,10 +61,16 @@ names.
 
 ## What runs inside the actor
 
-An ax `ax.io/v1alpha1 Task` is applied to the ax-server (agent-substrate
-actors, gVisor sandbox), resumed, and polled via `ax ssh` until the staged
-command writes the result marker to `/workspace/.omp-remote-result`, then the
-task is deleted. Env passthrough flows as Task env; the host cwd is
+An ax `ax.io/v1alpha1 Task` is applied with a tiny fixed boot-stub command
+(agent-substrate actors, gVisor sandbox), resumed, then the payload — host-cwd
+tarball plus a generated entry script — is staged via a single `ax ssh` stdin
+stream (the stub extracts it to `/workspace` and executes the entry script).
+Output is polled via `ax ssh -- cat` until the entry script writes the
+sentinel-delimited result to `/workspace/omp-result.txt`; the task is then
+deleted. The payload must ride ssh, never the Task manifest: ax's reconciler
+embeds the whole Task YAML in the actor template's `AX_TASK_YAML` env, and
+substrate caps every env value at 32 KiB. Env passthrough is therefore
+expanded inside the entry script, not declared as Task env; the host cwd is
 unavailable inside the sandbox (staged config only — config.yml, models.yml,
 settings.json, auth/*).
 
