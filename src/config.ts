@@ -37,6 +37,22 @@ export interface K8sRunnerConfig {
     cpus?: number;
 }
 
+export interface AxRunnerConfig {
+    type: "ax";
+    /** Task-runner image the actor boots (must contain ax-task-runner + runtime deps). */
+    image: string;
+    /** ax CLI argv prefix (e.g. ["--context", "admin@talos-default"]); default bare `ax`. */
+    ax?: string[];
+    /** Kubernetes namespace where ax-server runs; default ax-system. */
+    namespace?: string;
+    /** ax atespace for Tasks; default "default". */
+    atespace?: string;
+    envPassthrough?: string[];
+    timeoutMs?: number;
+    /** Default model forwarded to the remote omp (`--model`); per-item spec.model wins. */
+    model?: string;
+}
+
 export interface GenericRunnerConfig {
     type: "command";
     /** argv with {task} {model} {cwd} {id} token substitution (caller owns quoting). */
@@ -53,7 +69,7 @@ export interface RemoteAgentsConfig {
     runners: Record<string, RunnerConfig>;
 }
 
-const RUNNER_TYPES: Record<string, true> = { container: true, k8s: true, command: true };
+const RUNNER_TYPES: Record<string, true> = { container: true, k8s: true, command: true, ax: true };
 
 export function ompAgentDir(home = homedir()): string {
     return join(home, ".omp", "agent");

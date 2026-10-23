@@ -69,6 +69,16 @@ wins).
             "cpus": 4,                    // pod CPU request/limit (request 2 / limit 4 default)
             "timeoutMs": 900000
         },
+        "ax": {
+            "type": "ax",
+            // Task-runner image the actor boots (must contain ax-task-runner).
+            "image": "ghcr.io/yurifrl/ax/ax-task-runner@sha256:a249fde…",
+            "ax": ["--context", "admin@talos-default"], // optional argv prefix for ax CLI
+            "namespace": "ax-system",                   // where ax-server runs
+            "atespace": "default",                      // Task atespace
+            "envPassthrough": ["*_API_KEY", "*_TOKEN"],
+            "timeoutMs": 1200000
+        },
         "anything": {
             "type": "command",
             // {task} {model} {cwd} {id} tokens are substituted; or set
@@ -96,6 +106,11 @@ names.
 - `k8s` — stages flat config files as a ConfigMap, runs the pod with resource
   limits, streams logs as output; cleans up pod + ConfigMap afterwards.
   Cannot mount the host cwd.
+- `ax` — applies an `ax.io/v1alpha1 Task` to the ax-server (agent-substrate
+  actors, gvisor sandbox), resumes it, polls via `ax ssh` until the staged
+  command writes the result marker to `/workspace/.omp-remote-result`, then
+  deletes the task. Env passthrough flows as Task env; workdir is unavailable
+  inside the sandbox (staged config only).
 - `command` — no staging; you own the environment.
 
 ## Verification
@@ -111,7 +126,17 @@ bun run smoke:container -- --e2e # stage-2: full omp-in-container turn (slow fir
 - k8s adapter untested against a live cluster.
 - k8s pods cannot mount the host cwd — workdir contents are unavailable
   inside the pod.
+- **ax runner verified live** (2026-10-23): applied → resumed → gvisor actor
+  executed omp → result read via `ax ssh`. Setup notes for this cluster: the
+  `atelet` DaemonSet must run on the worker's node (worker reports capacity
+  through `ateom-support.sock`); the `ax` CLI hardcodes a 15 s resume deadline
+  that races cold provisioning (~80 s first boot, template + golden restore) —
+  use `~/.local/bin/axresume` (120 s deadline, ships separately) or tolerate
+  `DeadlineExceeded` and poll the task phase; the atenet-router lazily caches
+  actor routes (restart the deployment or retry if `ax ssh` reports
+  `error resuming actor` right after boot).
 - No orphan cleanup if the host dies mid-run: `container run --rm` cleanup
-  relies on the CLI process surviving; k8s cleanup is in the `finally` path.
+  relies on the CLI process surviving; k8s/ax cleanup is in the `finally`
+  path.
 - Runner-side timeouts kill the CLI but remote pids inside an
   already-created VM/pod are only bounded by the runtime itself.

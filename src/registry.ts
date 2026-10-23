@@ -9,11 +9,12 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { RunnerConfig } from "./config.ts";
 import type { RemoteRunner } from "./types.ts";
+import { createAxRunner } from "./runners/ax.ts";
 import { createContainerRunner } from "./runners/container.ts";
 import { createK8sRunner } from "./runners/k8s.ts";
 import { createGenericRunner } from "./runners/generic.ts";
 
-export const BUILTIN_RUNNER_TYPES = ["container", "k8s", "command"] as const;
+export const BUILTIN_RUNNER_TYPES = ["container", "k8s", "command", "ax"] as const;
 
 /** Resolve env-passthrough patterns (exact name or `*` glob, e.g. `*_API_KEY`) against the parent env. */
 export function resolvePassthroughEnv(patterns: string[], env = process.env): Record<string, string> {
@@ -37,6 +38,8 @@ export function createRunner(cfg: RunnerConfig, home: string): RemoteRunner {
             return createContainerRunner(cfg, home);
         case "k8s":
             return createK8sRunner(cfg, home);
+        case "ax":
+            return createAxRunner(cfg, home);
         case "command":
             return createGenericRunner(cfg);
         default:
