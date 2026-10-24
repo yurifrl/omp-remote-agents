@@ -130,6 +130,8 @@ assert.equal(tool.name, "remote_run");
 assert.equal(tool.parameters.safeParse({ task: "ping" }).success, true);
 assert.equal(tool.parameters.safeParse({}).success, false);
 assert.equal(tool.parameters.safeParse({ task: "" }).success, false);
+assert.equal(tool.parameters.safeParse({ command: "uname -a" }).success, true);
+assert.equal(tool.parameters.safeParse({ task: "ping", command: "uname -a" }).success, false);
 
 // 2. Unknown runner rejected before any spawn.
 await assert.rejects(
@@ -147,7 +149,17 @@ for (const params of [{ task: "ping", runner: "ax" }, { task: "ping" }]) {
     assert.equal(res.details.exitCode, 0);
 }
 
-// 4. Cleanup ran and the new staged lifecycle exercised: the stub recorded
+// 4. Command mode stages an entry script that runs the plain command, not omp.
+const cmdRes = await tool.execute("smoke", { command: "uname -a" }, undefined, () => {}, undefined);
+assert.equal(cmdRes.isError, undefined, JSON.stringify(cmdRes));
+const cmdStage = mkdtempSync(join(tmpdir(), "smoke-cmd-"));
+await new Response(Bun.spawn(["tar", "-xzf", process.env.SMOKE_STAGE_FILE!, "-C", cmdStage]).stdout as ReadableStream).text();
+const cmdEntry = readFileSync(join(cmdStage, "omp-entry.sh"), "utf8");
+assert.match(cmdEntry, /sh -c /, "command mode must run the plain command");
+assert.match(cmdEntry, /uname -a/);
+assert.doesNotMatch(cmdEntry, /bun x/, "command mode must not start the remote omp session");
+
+// 5. Cleanup ran and the new staged lifecycle exercised: the stub recorded
 //    the delete verb, a sub-32KiB manifest, and a binary stage stream.
 const log = readFileSync(process.env.SMOKE_AX_LOG!, "utf8");
 assert.match(log, /deleted/);

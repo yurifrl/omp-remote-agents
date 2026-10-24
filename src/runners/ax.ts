@@ -83,13 +83,18 @@ function delay(ms: number): Promise<void> {
 
 /**
  * The entry script delivered inside the stage archive: exports passthrough
- * env, unpacks the staged workdir tarball, runs headless omp, then writes a
+ * env, unpacks the staged workdir tarball, runs the remote workload (a plain
+ * shell command, or headless omp when no command was given), then writes a
  * sentinel-delimited result file (stdout tail + stderr tail + exit code).
  */
-function buildScript(env: Record<string, string>, model: string | undefined, task: string): string {
+function buildScript(env: Record<string, string>, model: string | undefined, spec: RunnerSpawnSpec): string {
     const envExports = Object.entries(env)
         .map(([k, v]) => `export ${k}=${shq(v)}`)
         .join("\n");
+    const redirect = "> /workspace/omp-stdout.txt 2> /workspace/omp-stderr.txt";
+    const runLine = spec.command
+        ? `sh -c ${shq(spec.command)} ${redirect}`
+        : `bun x @oh-my-pi/pi-coding-agent@latest -p ${shq(spec.task!)}${model ? ` --model ${shq(model)}` : ""} ${redirect}`;
     return [
         "set -u",
         "mkdir -p /workspace/omp-work /agent-home",
@@ -97,7 +102,7 @@ function buildScript(env: Record<string, string>, model: string | undefined, tas
         "tar -xzf /workspace/workdir.tgz -C /workspace/omp-work --no-same-owner",
         "cd /workspace/omp-work",
         envExports,
-        `bun x @oh-my-pi/pi-coding-agent@latest -p ${shq(task)}${model ? ` --model ${shq(model)}` : ""} > /workspace/omp-stdout.txt 2> /workspace/omp-stderr.txt`,
+        runLine,
         "code=$?",
         `printf '__OMP_EXIT__=%s\\n' "$code" >> /workspace/omp-stdout.txt`,
         `{ echo '===OMP_RESULT==='; tail -c 12000 /workspace/omp-stdout.txt; echo '===OMP_STDERR==='; tail -c 3000 /workspace/omp-stderr.txt; echo '${RESULT_DONE}'; } > ${RESULT_FILE}`,
@@ -142,7 +147,7 @@ export function createAxRunner(cfg: AxRunnerConfig): RemoteRunner {
                 if (tarRes.exitCode !== 0) {
                     return fail(tarRes, `tar of ${spec.cwd} failed`);
                 }
-                writeFileSync(join(payload, "omp-entry.sh"), buildScript(env, model, spec.task), { mode: 0o755 });
+                writeFileSync(join(payload, "omp-entry.sh"), buildScript(env, model, spec), { mode: 0o755 });
                 const stageTgz = join(stage, "omp-staged.tgz");
                 const packRes = await runCommand(["tar", "-czf", stageTgz, "-C", payload, "."], {
                     timeoutMs: 120_000,

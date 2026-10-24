@@ -74,6 +74,22 @@ expanded inside the entry script, not declared as Task env; the host cwd is
 unavailable inside the sandbox (staged config only — config.yml, models.yml,
 settings.json, auth/*).
 
+## Command mode
+
+`remote_run` accepts an optional `command` (mutually exclusive with `task`): a
+plain shell command runs in the sandbox instead of a remote omp session — same
+staging, result-file, and cleanup plumbing, no `bun`/model-API dependency. The
+`remote-ax` proxy agent treats assignments starting with `!` as command mode.
+
+`scripts/run.ts` is a CLI wrapper over the same runner, for use when the
+loaded extension is stale (schema has no `command` yet):
+
+```bash
+bun run scripts/run.ts --command 'uname -a'   # or --task '<prompt>'
+```
+
+It prints the remote output on stdout and lifecycle progress on stderr.
+
 ## Verification
 
 ```bash

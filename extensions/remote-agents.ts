@@ -34,8 +34,14 @@ export default function (pi: ExtensionAPI) {
             runner: z.string().optional().describe(
                 "Runner name from remote-agents.json; defaults to defaultRunner, or the only configured runner",
             ),
-            task: z.string().min(1).describe("Complete task prompt handed to the remote omp session"),
-        }),
+            task: z.string().min(1).optional().describe("Complete task prompt handed to the remote omp session"),
+            command: z.string().min(1).optional().describe(
+                "Plain shell command executed in the sandbox instead of a remote omp session",
+            ),
+        }).refine(
+            (p) => Boolean(p.task) !== Boolean(p.command),
+            { message: "exactly one of task or command is required" },
+        ),
         async execute(_toolCallId, params, signal, onUpdate, _ctx) {
             const cfg = loadRemoteAgentsConfig(process.cwd(), homedir());
             if (!cfg) {
@@ -53,7 +59,7 @@ export default function (pi: ExtensionAPI) {
             }
 
             const runId = randomUUID().slice(0, 8);
-            const runner = createAxRunner(runnerCfg, homedir());
+            const runner = createAxRunner(runnerCfg);
 
             let lastEmit = 0;
             let buffer = "";
@@ -72,6 +78,7 @@ export default function (pi: ExtensionAPI) {
                     agent: runnerKey!,
                     name: runnerKey!,
                     task: params.task,
+                    command: params.command,
                     cwd: process.cwd(),
                 },
                 { signal, onUpdate: throttledUpdate },

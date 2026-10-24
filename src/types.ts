@@ -12,8 +12,10 @@ export interface RunnerSpawnSpec {
     agent: string;
     /** Display label (task item `name`, falls back to agent name). */
     name: string;
-    /** The task prompt handed to the remote omp process. */
-    task: string;
+    /** The task prompt handed to the remote omp process (required unless `command` is set). */
+    task?: string;
+    /** Plain shell command run in the sandbox instead of a remote omp session. */
+    command?: string;
     /** Optional model override passed to the remote `omp -p --model`. */
     model?: string;
     /** Host working directory made available to the remote runtime. */
