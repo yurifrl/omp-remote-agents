@@ -9,6 +9,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { EgressPolicySpec } from "./egress.ts";
 
 export interface AxRunnerConfig {
     type: "ax";
@@ -20,6 +21,13 @@ export interface AxRunnerConfig {
     namespace?: string;
     /** ax atespace for Tasks; default "default". */
     atespace?: string;
+    /**
+     * Egress policy applied to the spawned actor: TLS passthrough rules by
+     * SNI hostname. Created between apply and resume — policies are read
+     * once at first DNS, so they must exist before first boot. Omit to keep
+     * the actor fully offline (Substrate deny-by-default).
+     */
+    egress?: EgressPolicySpec;
     envPassthrough?: string[];
     timeoutMs?: number;
     /** Default model forwarded to the remote omp (`--model`); per-item spec.model wins. */

@@ -9,7 +9,8 @@
     ]
   },
   "scripts": {
-    "smoke:load": "bun run scripts/smoke-load.ts"
+    "smoke:load": "bun run scripts/smoke-load.ts",
+    "e2e:egress": "bun run scripts/e2e-egress.ts"
   },
   "devDependencies": {
     "zod": "^4.6.7"

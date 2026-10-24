@@ -28,6 +28,7 @@ import { tmpdir } from "node:os";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { AxRunnerConfig } from "../config.ts";
+import { ensureActorEgress } from "../egress.ts";
 import { runCommand, shq } from "../subprocess.ts";
 import type { RemoteRunner, RunnerResult, RunnerSpawnSpec, SpawnOptions } from "../types.ts";
 
@@ -134,7 +135,13 @@ export function createAxRunner(cfg: AxRunnerConfig): RemoteRunner {
                 }
             };
 
+            let tunnel: { env: Record<string, string>; close: () => void } | undefined;
             try {
+                // One tunnel for the whole run; every ax CLI call below uses
+                // AX_SERVER instead of the CLI's own racy tunnel.
+                throttled("opening ax-server tunnel");
+                tunnel = await axServerTunnel(opts.signal);
+
                 // Pack the host cwd (the sandbox has no access to host paths)
                 // and bundle it with the entry script into one archive.
                 throttled(`packing workdir ${spec.cwd}`);
@@ -178,10 +185,30 @@ export function createAxRunner(cfg: AxRunnerConfig): RemoteRunner {
 
                 throttled(`applying ax task ${taskName}`);
                 const applyRes = await runCommand([...axBase, "apply", "-f", manifestPath], {
+                    env: tunnel.env,
                     timeoutMs: 60_000,
                     signal: opts.signal,
                 });
                 if (applyRes.exitCode !== 0) return fail(applyRes);
+
+                // The actor now exists (Suspended, no traffic yet). Substrate
+                // reads the egress policy once at the guest's first DNS query
+                // and caches it for the actor's lifetime — create it before
+                // the first resume or the sandbox stays offline. Errors here
+                // kill the run early: a resumed actor without policy can
+                // never pick one up.
+                if (cfg.egress?.rules?.length) {
+                    throttled(`creating egress policy for actor ${taskName}`);
+                    await ensureActorEgress({
+                        atespace: cfg.atespace ?? "default",
+                        actor: taskName,
+                        policy: cfg.egress,
+                        kubectl: ["kubectl", ...(cfg.ax ?? [])],
+                        signal: opts.signal,
+                    }).catch((err: unknown) => {
+                        throw new Error(`egress policy setup failed: ${err instanceof Error ? err.message : String(err)}`);
+                    });
+                }
 
                 // Resume. `ax resume`'s CLI hardcodes a 15s context that races
                 // the substrate workflow (template reconcile + golden restore
@@ -191,10 +218,12 @@ export function createAxRunner(cfg: AxRunnerConfig): RemoteRunner {
                 // CLI fallback tolerates DeadlineExceeded because the resume
                 // completes server-side anyway.
                 throttled("resuming task");
-                const resumeArgv = existsSync(join(homedir(), ".local", "bin", "axresume"))
-                    ? ["axresume", `127.0.0.1:${await axServerPort(axBase)}`, taskName]
+                const axServerPort = Number(tunnel.env.AX_SERVER?.match(/:(\d+)$/)?.[1]);
+                const resumeArgv = existsSync(join(homedir(), ".local", "bin", "axresume")) && axServerPort
+                    ? ["axresume", `127.0.0.1:${axServerPort}`, taskName]
                     : [...axBase, "resume", "task", taskName];
                 const resumeRes = await runCommand(resumeArgv, {
+                    env: tunnel.env,
                     timeoutMs: 240_000,
                     signal: opts.signal,
                 });
@@ -215,6 +244,7 @@ export function createAxRunner(cfg: AxRunnerConfig): RemoteRunner {
                     if (opts.signal?.aborted) return cancelled(runId, opts);
                     await delay(POLL_INTERVAL_MS);
                     const status = await runCommand([...axBase, "get", "task", taskName, "-o", "yaml"], {
+                        env: tunnel.env,
                         timeoutMs: 30_000,
                         signal: opts.signal,
                     });
@@ -257,14 +287,18 @@ export function createAxRunner(cfg: AxRunnerConfig): RemoteRunner {
                 throttled(`staging payload (${(stageBytes.byteLength / 1e6).toFixed(1)} MB) via ax ssh`);
                 let stageRes = await runCommand([...axBase, "ssh", taskName, "--", "sh", "-c", STAGE_REMOTE], {
                     stdin: stageBytes,
+                    env: tunnel.env,
                     timeoutMs: 300_000,
                     signal: opts.signal,
                 });
                 for (let attempt = 1; attempt < 3 && stageRes.exitCode !== 0; attempt++) {
                     throttled("staging failed; retrying");
-                    await delay(2_000);
+                    // The atenet-router caches actor routes lazily; ssh right
+                    // after boot races the route being learned.
+                    await delay(5_000 * attempt);
                     stageRes = await runCommand([...axBase, "ssh", taskName, "--", "sh", "-c", STAGE_REMOTE], {
                         stdin: stageBytes,
+                        env: tunnel.env,
                         timeoutMs: 300_000,
                         signal: opts.signal,
                     });
@@ -279,7 +313,8 @@ export function createAxRunner(cfg: AxRunnerConfig): RemoteRunner {
                     await delay(POLL_INTERVAL_MS);
                     throttled("polling remote result");
                     const sshRes = await runCommand([...axBase, "ssh", taskName, "--", "cat", RESULT_FILE], {
-                        timeoutMs: 30_000,
+                        env: tunnel.env,
+                        timeoutMs: 60_000,
                         signal: opts.signal,
                     });
                     if (sshRes.exitCode === 0 && sshRes.stdout.includes(RESULT_DONE)) {
@@ -314,8 +349,9 @@ export function createAxRunner(cfg: AxRunnerConfig): RemoteRunner {
             } finally {
                 // Delete the Task: removes the actor and its sandbox.
                 throttled("deleting ax task");
-                await runCommand([...axBase, "delete", "task", taskName], { timeoutMs: 60_000 }).catch(() => undefined);
+                await runCommand([...axBase, "delete", "task", taskName], { env: tunnel?.env, timeoutMs: 60_000 }).catch(() => undefined);
                 rmSync(stage, { recursive: true, force: true });
+                tunnel?.close();
             }
         },
     };
@@ -353,10 +389,52 @@ function cancelled(runId: string, opts: SpawnOptions): RunnerResult {
     return { id: runId, exitCode: null, output: "", stderr: "aborted", ok: false, killed: true, timedOut: false };
 }
 
-/** Discover the local ax-server gRPC port from an active `ax tunnel` (its
- * `list` JSON carries localPort); falls back to 18080/18082 conventions. */
-async function axServerPort(axBase: string[]): Promise<number> {
-    const list = await runCommand([...axBase, "tunnel", "list"], { timeoutMs: 20_000 });
-    const match = list.stdout.match(/"localPort":\s*(\d+)/) ?? list.stdout.match(/localPort[":\s]+(\d+)/);
-    return match ? Number(match[1]) : 18080;
+/**
+ * Open a runner-owned port-forward to ax-server and export it as AX_SERVER.
+ * The ax CLI's internal tunnel gives remote clusters only a 3s health window
+ * (400ms probes) — on a remote API it races the SPDY handshake and fails
+ * intermittently. Owning the tunnel (port 0:8080, generous health poll) and
+ * passing AX_SERVER removes that race: EnsureServerURL honors it directly.
+ */
+async function axServerTunnel(signal?: AbortSignal): Promise<{ env: Record<string, string>; close: () => void }> {
+    const proc = Bun.spawn(
+        ["kubectl", "-n", "ax-system", "port-forward", "svc/ax-server", "0:8080"],
+        { stdout: "pipe", stderr: "pipe" },
+    );
+    const close = () => {
+        try {
+            proc.kill();
+        } catch {
+            // already exited
+        }
+    };
+    signal?.addEventListener("abort", close, { once: true });
+
+    const reader = (proc.stdout as ReadableStream<Uint8Array>).getReader();
+    const deadline = Date.now() + 25_000;
+    let port: number | undefined;
+    while (Date.now() < deadline && !port) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const match = /Forwarding from 127\.0\.0\.1:(\d+) ->/.exec(new TextDecoder().decode(value));
+        if (match) port = Number(match[1]);
+    }
+    reader.releaseLock();
+    if (!port) {
+        close();
+        throw new Error("kubectl port-forward to ax-server never reported a port");
+    }
+
+    const url = `http://127.0.0.1:${port}/healthz`;
+    while (Date.now() < deadline) {
+        try {
+            const res = await fetch(url, { signal: AbortSignal.timeout(1_000) });
+            if (res.status === 200) return { env: { AX_SERVER: `http://127.0.0.1:${port}` }, close };
+        } catch {
+            // not ready yet; keep polling
+        }
+        await new Promise((r) => setTimeout(r, 300));
+    }
+    close();
+    throw new Error(`ax-server tunnel ${url} never became healthy`);
 }

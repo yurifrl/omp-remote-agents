@@ -94,15 +94,46 @@ It prints the remote output on stdout and lifecycle progress on stderr.
 
 ```bash
 bun run smoke:load   # offline: remote_run registers, schema parses, full ax lifecycle runs against a stub `ax` CLI
+bun run e2e:egress   # live: apply → policy → resume → stage → guest HTTPS probe (set KUBECONFIG; E2E_IMAGE overrides the image)
 ```
+
+## Egress
+
+The ax runner provisions the spawned actor's Substrate `default`
+`EgressPolicy` between `ax apply` and the first resume (Substrate reads it
+once at the guest's first DNS query and caches it for the actor's lifetime;
+a policy created after boot is never picked up). Rules are **TLS
+passthrough by SNI hostname** — TLS is forwarded without decryption, so the
+guest's stock trust store works; no gateway-CA provisioning in the image is
+needed — though the current chart build MITMs with a client-mTLS bind
+instead (divergence documented in Known gaps):
+
+```jsonc
+// ~/.omp/agent/remote-agents.json
+{
+    "runners": {
+        "ax": {
+            "type": "ax",
+            "image": "ghcr.io/yurifrl/task-arch-probe:v1",
+            "egress": {
+                "rules": [
+                    { "hostnames": ["api.anthropic.com", "api.openai.com"] },
+                    { "hostnames": ["*.example.com"], "ports": [443] }
+                ]
+            }
+        }
+    }
+}
+```
+
+Implementation: a minimal hand-rolled protobuf encoder speaks directly to
+the `ateapi.Control` gRPC service through a kubectl port-forward, with the
+`ax-server` ServiceAccount token minted via `kubectl create token`
+(`src/egress.ts`). Any hostname not in a rule stays denied — Substrate is
+deny-by-default.
 
 ## Known gaps
 
-- Headless omp inside the actor cannot reach model APIs yet: sandbox egress
-  TLS through the atunnel → atenet-router → atenet-egress path fails after
-  ClientHello. Lifecycle (apply → resume → run → result → cleanup) is
-  verified live (2026-10-23); the model round-trip is blocked on the
-  substrate egress fix.
 - Setup notes for this cluster: the `atelet` DaemonSet must run on the
   worker's node (worker reports capacity through `ateom-support.sock`); the
   `ax` CLI hardcodes a 15 s resume deadline that races cold provisioning
@@ -111,6 +142,23 @@ bun run smoke:load   # offline: remote_run registers, schema parses, full ax lif
   the task phase; the atenet-router lazily caches actor routes (restart the
   deployment or retry if `ax ssh` reports `error resuming actor` right after
   boot).
+- **Egress data path (verified on `admin@talos-default-lan`, agentgateway
+  `v1.7.0-alpha.1`)**: policy management works end-to-end (token →
+  port-forward → `CreateActorEgressPolicy` OK for live actors), the policy
+  is read at the guest's first DNS query (principal
+  `spiffe://…/sa/atelet`, all rules returned), and DNS lifts (guest resolves
+  all policy hostnames). The TLS hop then fails: the egress gateway's 8443
+  bind is **mTLS with a dynamic MITM CA** (`dynamicCa` +
+  `egress-mitm-ca-pool` — *not* TLS passthrough as designed) and aborts
+  guest handshakes with `TLSV13_ALERT_CERTIFICATE_REQUIRED` — the guest
+  never presents an actor identity cert, so `substrateEgressActorResolution`
+  never runs (zero gateway-originated `GetActorEgressPolicy` calls in
+  ate-api logs; outbound DNS+TCP from the egress pod's netns works). Guest
+  sees `[Errno 104] Connection reset by peer`. Substrate-side chart issue,
+  runner wiring is correct.
+- The `ghcr.io/yurifrl/ax/ax-task-runner` image ships **no bun** (Python
+  3.12-based). Remote-omp mode (`bun x @oh-my-pi/pi-coding-agent`) needs a
+  bun-capable image on this cluster; command mode works with this image.
 - No orphan cleanup if the host dies mid-run: ax cleanup is in the `finally`
   path only.
 - A runner-side timeout kills the CLI but the actor keeps running until the
