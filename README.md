@@ -105,8 +105,9 @@ once at the guest's first DNS query and caches it for the actor's lifetime;
 a policy created after boot is never picked up). Rules are **TLS
 passthrough by SNI hostname** — TLS is forwarded without decryption, so the
 guest's stock trust store works; no gateway-CA provisioning in the image is
-needed — though the current chart build MITMs with a client-mTLS bind
-instead (divergence documented in Known gaps):
+needed. (Per the substrate contract the egress gateway first requires an
+actor-identity client cert from the worker's atunnel — see Known gaps for
+the observed behavior on the current chart build.)
 
 ```jsonc
 // ~/.omp/agent/remote-agents.json
@@ -148,14 +149,25 @@ deny-by-default.
   is read at the guest's first DNS query (principal
   `spiffe://…/sa/atelet`, all rules returned), and DNS lifts (guest resolves
   all policy hostnames). The TLS hop then fails: the egress gateway's 8443
-  bind is **mTLS with a dynamic MITM CA** (`dynamicCa` +
-  `egress-mitm-ca-pool` — *not* TLS passthrough as designed) and aborts
-  guest handshakes with `TLSV13_ALERT_CERTIFICATE_REQUIRED` — the guest
-  never presents an actor identity cert, so `substrateEgressActorResolution`
-  never runs (zero gateway-originated `GetActorEgressPolicy` calls in
-  ate-api logs; outbound DNS+TCP from the egress pod's netns works). Guest
-  sees `[Errno 104] Connection reset by peer`. Substrate-side chart issue,
-  runner wiring is correct.
+  bind requires client mTLS against the **Actor Identity CA** — by design;
+  the connection must carry an actor cert minted via atelet's
+  `MintActorCertificate` and presented by **atunnel** in the worker pod
+  (`substrate@v0.5.0 docs/network-egress.md`), with identity verified
+  *before* any `GetActorEgressPolicy` call. Our guests present no valid
+  actor-identity cert (gateway aborts handshakes with
+  `TLSV13_ALERT_CERTIFICATE_REQUIRED`, zero gateway-originated policy
+  lookups in ate-api logs; outbound DNS+TCP from the egress pod's netns
+  works), so `substrateEgressActorResolution` never runs and the guest sees
+  `[Errno 104] Connection reset by peer`. Root cause is upstream of the
+  gateway: the guest image / worker path never runs the substrate egress
+  preparation (`PrepareEgress` → `MintActorCertificate`), so nothing dials
+  the gateway with the required `spiffe://substrate-actor.local/worker-for-actor/…`
+  identity. Note the "dynamic MITM CA" on the bind is the intercept side of
+  this same config (the design doc's TLS passthrough applies to the
+  allowed-hostname leg once identity passes). Runner wiring is correct;
+  unblocking guest HTTPS needs a guest/runtime whose worker presents the
+  actor cert (bun-capable image on the substrate ateom runtime, or a chart
+  version whose golden actor path wires atunnel egress).
 - The `ghcr.io/yurifrl/ax/ax-task-runner` image ships **no bun** (Python
   3.12-based). Remote-omp mode (`bun x @oh-my-pi/pi-coding-agent`) needs a
   bun-capable image on this cluster; command mode works with this image.
