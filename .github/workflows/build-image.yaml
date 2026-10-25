@@ -48,6 +48,11 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Plain single-manifest push (no OCI index, no unknown/unknown
+          # attestation entries): digest-pinned pulls on the amd64 gVisor
+          # substrate must resolve straight to the linux/amd64 manifest.
+          provenance: false
+          sbom: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
