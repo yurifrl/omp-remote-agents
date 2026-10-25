@@ -93,9 +93,18 @@ function buildScript(env: Record<string, string>, model: string | undefined, spe
         .map(([k, v]) => `export ${k}=${shq(v)}`)
         .join("\n");
     const redirect = "> /workspace/omp-stdout.txt 2> /workspace/omp-stderr.txt";
+    // Remote-agent workload (only evaluated for task specs, never command
+    // specs): prefer the image-baked agent, then a vendored copy staged in
+    // the workdir (no guest network needed); `bun x` is the last resort.
+    // Chained `if/else` (not `&&/||`) so a nonzero agent exit is the run's
+    // exit — the fallback previously re-ran `bun x` over real omp failures.
+    const agentLine = (task: string, model?: string): string => {
+        const args = `-p ${shq(task)}${model ? ` --model ${shq(model)}` : ""}`;
+        return `if [ -x /usr/local/bin/omp ]; then /usr/local/bin/omp ${args}; elif [ -x ./node_modules/.bin/omp ]; then ./node_modules/.bin/omp ${args}; else bun x @oh-my-pi/pi-coding-agent@latest ${args}; fi`;
+    };
     const runLine = spec.command
         ? `sh -c ${shq(spec.command)} ${redirect}`
-        : `bun x @oh-my-pi/pi-coding-agent@latest -p ${shq(spec.task!)}${model ? ` --model ${shq(model)}` : ""} ${redirect}`;
+        : `${agentLine(spec.task!, model)} ${redirect}`;
     return [
         "set -u",
         "mkdir -p /workspace/omp-work /agent-home",
