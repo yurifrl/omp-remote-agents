@@ -62,6 +62,8 @@ jobs:
           echo "Smoke-testing $DIGEST"
           docker run --rm --entrypoint /bin/sh "$DIGEST" -euxc '
             bun --version
+            omp --version | grep 18.12.6
+            test -x /usr/local/bin/omp
             test -x /usr/local/bin/ax-task-runner
             ax-task-runner -h 2>&1 | head -3 || true
             test -x /bin/sh

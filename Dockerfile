@@ -27,4 +27,14 @@ RUN curl -fsSL "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERS
     && rm -rf /tmp/bun.zip /tmp/bun-install \
     && bun --version
 
+# Bake the omp agent so remote-omp mode needs no node_modules staging (the
+# 300 MB payload staging path dies on this cluster). The two scoped packages
+# land in one global node_modules tree, so the pi-natives loader resolves
+# pi-natives-linux-x64 as a sibling; the bin is /usr/local/bin/omp.
+RUN BUN_INSTALL=/usr/local bun install -g \
+        @oh-my-pi/pi-coding-agent@18.12.6 \
+        @oh-my-pi/pi-natives-linux-x64@18.12.6 \
+    && omp --version \
+    && omp --help >/dev/null
+
 ENTRYPOINT ["/usr/local/bin/ax-task-runner"]
